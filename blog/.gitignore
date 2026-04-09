@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+content/settings.local.json
+dist/

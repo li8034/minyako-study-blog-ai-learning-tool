@@ -1,0 +1,16 @@
+{
+  "common": {
+    "siteTitle": "Minyako的学习日志",
+    "fontScale": 1,
+    "defaultSidebarCollapsed": false,
+    "compactCards": false
+  },
+  "llm": {
+    "enabled": false,
+    "endpoint": "https://api.openai.com/v1/chat/completions",
+    "apiKey": "",
+    "model": "gpt-4.1-mini",
+    "temperature": 0.2,
+    "systemPrompt": "你是一个中文学习助手。请结合给定文章上下文解释用户选中的词或短语，优先解释它在本文中的含义，再补充必要背景。表达要清晰、准确、面向初学者。"
+  }
+}

@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Minyako的学习日志</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-top">
+        <button class="icon-btn" id="sidebarToggle" type="button" title="收纳侧边栏">☰</button>
+        <div class="brand">
+          <span class="brand-badge">M</span>
+          <div class="brand-copy">
+            <strong id="sidebarBrandTitle">Minyako的学习日志</strong>
+            <span>一款 AI 辅助学习工具</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-scroll">
+        <div class="panel">
+          <div class="panel-head">
+            <span>导航</span>
+          </div>
+          <button class="nav-link active" id="homeButton" type="button">首页总览</button>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <span>分类目录</span>
+            <button class="text-btn" id="openCategoryModal" type="button">新增分类</button>
+          </div>
+          <div id="categoryTree" class="category-tree"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <span>导入文档</span>
+            <button class="text-btn" id="openImportModal" type="button">上传文件</button>
+          </div>
+          <p class="panel-tip">
+            支持 Markdown 与 PDF。导入后可搜索全文、选词批注、查看标注汇总，并调用 AI 解释术语。
+          </p>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar" id="topbar">
+        <div class="topbar-row">
+          <div class="topbar-copy">
+            <span class="topbar-kicker">Study Blog</span>
+            <h1 id="topbarTitle">Minyako的学习日志</h1>
+            <p>导入 Markdown 与 PDF，搜索全文，批注重点，并用 AI 解释选中的内容。</p>
+          </div>
+          <div class="topbar-actions">
+            <button class="ghost-btn" id="headerImportButton" type="button">导入文档</button>
+            <button class="ghost-btn" id="openSettingsButton" type="button">设置</button>
+            <button class="primary-btn" id="headerCategoryButton" type="button">新增分类</button>
+          </div>
+        </div>
+        <div class="topbar-tools">
+          <label class="search-box">
+            <span class="search-icon">⌕</span>
+            <input id="searchInput" type="search" placeholder="搜索博客文章标题、摘要或正文关键词">
+          </label>
+          <button class="ghost-btn small hidden" id="clearSearchButton" type="button">清空搜索</button>
+        </div>
+      </header>
+
+      <section class="content-area" id="contentArea">
+        <div class="loading-card">正在加载博客数据...</div>
+      </section>
+    </main>
+  </div>
+
+  <div class="selection-toolbar hidden" id="selectionToolbar">
+    <button class="toolbar-btn" id="highlightSelection" type="button">高亮</button>
+    <button class="toolbar-btn" id="annotateSelection" type="button">批注</button>
+    <button class="toolbar-btn accent" id="askSelection" type="button">问 LLM</button>
+  </div>
+
+  <div class="note-popover hidden" id="notePopover">
+    <div class="note-popover-head">
+      <strong id="notePopoverTitle">批注</strong>
+      <button class="icon-btn small" id="closeNotePopover" type="button">×</button>
+    </div>
+    <div class="note-popover-quote" id="noteQuote"></div>
+    <div class="note-editor-stack">
+      <textarea id="noteEditor" rows="6" placeholder="在这里记录你的理解、提醒或疑问..."></textarea>
+      <div class="note-preview-wrap">
+        <div class="note-preview-label">Markdown 预览</div>
+        <div id="notePreview" class="note-preview"></div>
+      </div>
+    </div>
+    <div class="note-popover-actions">
+      <button class="ghost-btn small" id="deleteNoteButton" type="button">删除标记</button>
+      <button class="primary-btn small" id="saveNoteButton" type="button">保存批注</button>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="importModal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>导入文档</h2>
+        <button class="icon-btn small" id="closeImportModal" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span>文档文件</span>
+          <input id="markdownFileInput" type="file" accept=".md,.markdown,.pdf,text/markdown,application/pdf">
+        </label>
+        <label class="field">
+          <span>页面标题（可选）</span>
+            <input id="pageTitleInput" type="text" placeholder="留空则自动使用文档标题、PDF 文件名或 Markdown 一级标题">
+        </label>
+        <label class="field">
+          <span>分类路径</span>
+          <input id="pageCategoryInput" type="text" value="科研学习/初学手册" placeholder="例如：科研学习/初学手册">
+        </label>
+        <p class="modal-tip">
+          支持导入 Markdown 与 PDF。每份文档都会生成独立页面，并保存正文、批注、预览缓存和资源文件。
+        </p>
+      </div>
+      <div class="modal-actions">
+        <button class="ghost-btn" id="cancelImportButton" type="button">取消</button>
+        <button class="primary-btn" id="confirmImportButton" type="button">导入文档</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="categoryModal">
+    <div class="modal-card narrow">
+      <div class="modal-head">
+        <h2>新增分类</h2>
+        <button class="icon-btn small" id="closeCategoryModal" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span>分类路径</span>
+          <input id="categoryPathInput" type="text" placeholder="例如：科研学习/实验记录 或 数学/线性代数">
+        </label>
+        <p class="modal-tip">
+          支持多级路径，使用 `/` 分隔。分类创建后即可在侧边栏中继续扩展和归档资料。
+        </p>
+      </div>
+      <div class="modal-actions">
+        <button class="ghost-btn" id="cancelCategoryButton" type="button">取消</button>
+        <button class="primary-btn" id="confirmCategoryButton" type="button">创建分类</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="settingsModal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>设置</h2>
+        <button class="icon-btn small" id="closeSettingsModal" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <section class="settings-section">
+          <h3>常规设置</h3>
+          <label class="field">
+            <span>博客名称</span>
+            <input id="settingSiteTitle" type="text" placeholder="Minyako的学习日志">
+          </label>
+          <label class="field">
+            <span>正文字号倍率</span>
+            <input id="settingFontScale" type="range" min="0.9" max="1.2" step="0.05">
+            <small id="settingFontScaleValue" class="field-help"></small>
+          </label>
+          <label class="check-field">
+            <input id="settingSidebarCollapsed" type="checkbox">
+            <span>默认收起侧边栏</span>
+          </label>
+          <label class="check-field">
+            <input id="settingCompactCards" type="checkbox">
+            <span>启用紧凑卡片布局</span>
+          </label>
+        </section>
+
+        <section class="settings-section">
+          <h3>LLM 配置</h3>
+          <label class="check-field">
+            <input id="settingLlmEnabled" type="checkbox">
+            <span>启用 LLM 解释功能</span>
+          </label>
+          <label class="field">
+            <span>Endpoint / Base URL</span>
+            <input id="settingLlmEndpoint" type="text" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
+          </label>
+          <label class="field">
+            <span>API Key</span>
+            <input id="settingLlmApiKey" type="password" placeholder="本地保存到 content/settings.json">
+          </label>
+          <label class="field">
+            <span>Model</span>
+            <input id="settingLlmModel" type="text" placeholder="gpt-4.1-mini">
+          </label>
+          <label class="field">
+            <span>Temperature</span>
+            <input id="settingLlmTemperature" type="number" min="0" max="2" step="0.1">
+          </label>
+          <label class="field">
+            <span>系统提示词</span>
+            <textarea id="settingLlmSystemPrompt" rows="5" placeholder="用于约束解释风格"></textarea>
+          </label>
+          <p class="modal-tip">当前实现兼容 OpenAI 风格的 `chat/completions` 或 `responses` 接口，也兼容直接填写以 `/v1` 结尾的 Base URL，后端会自动补全到正确接口。API Key 会保存到本地 `content/settings.json`。</p>
+        </section>
+      </div>
+      <div class="modal-actions">
+        <button class="ghost-btn" id="cancelSettingsButton" type="button">关闭</button>
+        <button class="primary-btn" id="saveSettingsButton" type="button">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="askModal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>问 LLM</h2>
+        <button class="icon-btn small" id="closeAskModal" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="answer-chip">当前选中</div>
+        <div id="askSelectedText" class="ask-selected"></div>
+        <label class="field">
+          <span>问题</span>
+          <textarea id="askQuestionInput" rows="4" placeholder="解释这个词的含义。"></textarea>
+        </label>
+        <div class="answer-chip">解释结果</div>
+        <div id="askAnswerOutput" class="ask-answer">提交问题后，LLM 会结合当前文章上下文来解释这个词或短语。</div>
+      </div>
+      <div class="modal-actions">
+        <button class="ghost-btn" id="closeAskFooterButton" type="button">关闭窗口</button>
+        <button class="ghost-btn" id="resetAskQuestionButton" type="button">恢复默认问题</button>
+        <button class="primary-btn" id="submitAskButton" type="button">发送请求</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
