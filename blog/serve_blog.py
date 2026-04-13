@@ -179,8 +179,30 @@ def page_extracted_text_path(page_id: str) -> Path:
     return page_dir(page_id) / "source.txt"
 
 
+def detect_page_source_type(page_id: str, meta: dict | None = None) -> str:
+    pdf_asset_exists = page_pdf_asset_path(page_id).exists()
+    declared = str((meta or {}).get("sourceType", "")).strip().lower()
+    if declared == "pdf":
+        return "pdf"
+    if pdf_asset_exists:
+        return "pdf"
+    return "markdown"
+
+
+def normalize_page_meta(page_id: str, meta: dict | None):
+    if not meta:
+        return None
+
+    normalized = dict(meta)
+    normalized["id"] = normalized.get("id") or page_id
+    normalized["sourceType"] = detect_page_source_type(page_id, normalized)
+    normalized["assetBasePath"] = normalized.get("assetBasePath") or f"/content/pages/{page_id}/assets/"
+    return normalized
+
+
 def load_page_meta(page_id: str):
-    return read_json(page_meta_path(page_id), None)
+    meta = read_json(page_meta_path(page_id), None)
+    return normalize_page_meta(page_id, meta)
 
 
 def load_manifest() -> dict:
@@ -198,7 +220,7 @@ def load_manifest() -> dict:
         if not meta_file.exists():
             continue
 
-        meta = read_json(meta_file, None)
+        meta = normalize_page_meta(entry.name, read_json(meta_file, None))
         if not meta:
             continue
 
@@ -231,11 +253,22 @@ def load_page_detail(page_id: str):
     markdown = page_markdown_path(page_id).read_text(encoding="utf-8") if page_markdown_path(page_id).exists() else ""
     rendered_html = page_rendered_path(page_id).read_text(encoding="utf-8") if page_rendered_path(page_id).exists() else ""
     notes = read_json(page_notes_path(page_id), {})
+    pdf_url = ""
+    extracted_text = ""
+    if str(meta.get("sourceType", "")).lower() == "pdf":
+        pdf_url = f"{meta.get('assetBasePath', f'/content/pages/{page_id}/assets/')}source.pdf"
+        extracted_text = (
+            page_extracted_text_path(page_id).read_text(encoding="utf-8")
+            if page_extracted_text_path(page_id).exists()
+            else ""
+        )
     return {
         "meta": meta,
         "markdown": markdown,
         "renderedHtml": rendered_html,
         "notes": notes,
+        "pdfUrl": pdf_url,
+        "extractedText": extracted_text,
     }
 
 
@@ -377,19 +410,59 @@ def update_page_rendered(page_id: str, rendered_html: str, notes):
     return meta
 
 
-def build_llm_messages(page_detail: dict, selected_text: str, question: str, llm_settings: dict):
+def build_llm_context(page_detail: dict, request_context: dict | None = None) -> str:
     page_meta = page_detail["meta"]
-    context_markdown = page_detail["markdown"][:12000]
+    source_type = str(page_meta.get("sourceType", "")).lower()
+    context_parts = []
+
+    if request_context:
+        page_number = int(request_context.get("pageNumber") or 0)
+        context_snippet = str(request_context.get("contextSnippet") or "").strip()
+        context_source = str(request_context.get("sourceType") or "").strip()
+        has_page_image = bool(str(request_context.get("pageImageDataUrl") or "").strip())
+        if context_snippet:
+            if context_source == "pdf" and page_number > 0:
+                context_parts.append(
+                    f"当前问题来自 PDF 原页第 {page_number} 页。以下是该页中选中位置附近的文字层上下文：\n{context_snippet[:5000]}"
+                )
+            else:
+                context_parts.append(f"以下是选中位置附近的正文上下文：\n{context_snippet[:5000]}")
+        if context_source == "pdf" and page_number > 0 and has_page_image:
+            context_parts.append(
+                f"本次请求还附带了 PDF 原页第 {page_number} 页选中区域附近的截图，请结合截图中的图表、公式、版面结构和邻近标注一起理解问题。"
+            )
+
+    if source_type == "pdf":
+        extracted_text = str(page_detail.get("extractedText") or "").strip()
+        if extracted_text:
+            context_parts.append(f"整份 PDF 的提取文本（供补充参考）：\n{extracted_text[:9000]}")
+    else:
+        context_markdown = str(page_detail.get("markdown") or "").strip()
+        if context_markdown:
+            context_parts.append(f"文章内容如下：\n{context_markdown[:12000]}")
+
+    if not context_parts:
+        context_parts.append("当前没有可用的正文上下文。")
+
+    return "\n\n".join(context_parts)
+
+
+def build_llm_messages(page_detail: dict, selected_text: str, question: str, llm_settings: dict, request_context: dict | None = None):
+    page_meta = page_detail["meta"]
+    source_type = str(page_meta.get("sourceType", "")).lower()
+    context_text = build_llm_context(page_detail, request_context)
     system_prompt = llm_settings.get("systemPrompt") or default_settings()["llm"]["systemPrompt"]
     user_prompt = (
         f"当前文章标题：{page_meta['title']}\n"
         f"当前文章分类：{page_meta['categoryPath']}\n"
+        f"文档来源类型：{source_type or 'markdown'}\n"
         f"选中的词或短语：{selected_text}\n"
         f"用户问题：{question}\n\n"
         "请先解释该词或短语在本文中的具体含义，再说明它在上下文中的作用。"
         "如果本文没有给出充分定义，请明确说明，然后补充必要的一般性解释。"
+        "如果当前问题来自 PDF 原页，请优先参考原页附近上下文，而不是把整份提取文本当作唯一依据。"
         "表达尽量清晰、准确、适合初学者。\n\n"
-        f"文章内容如下：\n{context_markdown}"
+        f"{context_text}"
     )
     return system_prompt, user_prompt
 
@@ -444,7 +517,7 @@ def extract_llm_text(response_data: dict) -> str:
     return ""
 
 
-def call_llm(page_detail: dict, selected_text: str, question: str) -> str:
+def call_llm(page_detail: dict, selected_text: str, question: str, request_context: dict | None = None) -> str:
     settings = load_settings()
     llm = settings["llm"]
 
@@ -457,29 +530,36 @@ def call_llm(page_detail: dict, selected_text: str, question: str) -> str:
     if not llm.get("apiKey"):
         raise ValueError("LLM API Key 未配置。")
 
-    system_prompt, user_prompt = build_llm_messages(page_detail, selected_text, question, llm)
+    system_prompt, user_prompt = build_llm_messages(page_detail, selected_text, question, llm, request_context)
     endpoint, endpoint_kind = resolve_llm_endpoint(llm["endpoint"])
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {llm['apiKey']}",
     }
+    page_image_data_url = str((request_context or {}).get("pageImageDataUrl") or "").strip()
 
     if endpoint_kind == "responses":
+        user_content = [{"type": "input_text", "text": user_prompt}]
+        if page_image_data_url:
+            user_content.append({"type": "input_image", "image_url": page_image_data_url})
         payload = {
             "model": llm["model"],
             "temperature": llm.get("temperature", 0.2),
             "input": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                {"role": "user", "content": user_content},
             ],
         }
     else:
+        user_content = [{"type": "text", "text": user_prompt}]
+        if page_image_data_url:
+            user_content.append({"type": "image_url", "image_url": {"url": page_image_data_url}})
         payload = {
             "model": llm["model"],
             "temperature": llm.get("temperature", 0.2),
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_content if page_image_data_url else user_prompt},
             ],
         }
 
@@ -495,6 +575,10 @@ def call_llm(page_detail: dict, selected_text: str, question: str) -> str:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         error_text = exc.read().decode("utf-8", errors="ignore")
+        if page_image_data_url:
+            fallback_context = dict(request_context or {})
+            fallback_context["pageImageDataUrl"] = ""
+            return call_llm(page_detail, selected_text, question, fallback_context)
         raise ValueError(f"LLM 请求失败: HTTP {exc.code} {error_text}") from exc
     except urllib.error.URLError as exc:
         raise ValueError(f"LLM 请求失败: {exc.reason}") from exc
@@ -604,6 +688,12 @@ class BlogHandler(SimpleHTTPRequestHandler):
                 page_id = payload.get("pageId", "").strip()
                 selected_text = payload.get("selectedText", "").strip()
                 question = payload.get("question", "").strip()
+                request_context = {
+                    "pageNumber": payload.get("contextPageNumber", 0),
+                    "contextSnippet": payload.get("contextSnippet", ""),
+                    "sourceType": payload.get("contextSource", ""),
+                    "pageImageDataUrl": payload.get("contextPageImageDataUrl", ""),
+                }
                 page_detail = load_page_detail(page_id)
                 if not page_detail:
                     self.send_json(404, {"error": "Page not found."})
@@ -614,7 +704,7 @@ class BlogHandler(SimpleHTTPRequestHandler):
                 if not question:
                     question = f"解释“{selected_text}”的含义。"
 
-                answer = call_llm(page_detail, selected_text, question)
+                answer = call_llm(page_detail, selected_text, question, request_context)
                 self.send_json(200, {"answer": answer})
                 return
 

@@ -1,0 +1,27 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local runtime files
+blog/__pycache__/
+blog/dist/
+blog/content/settings.local.json
+
+# User-imported content
+blog/content/pages/*
+!blog/content/pages/README.md
+
+# Nested repos / external experiments
+acac/
+
+# Local caches
+**/.cache/

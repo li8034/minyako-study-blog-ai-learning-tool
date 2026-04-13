@@ -1,8 +1,10 @@
 (function () {
   const UI_STORAGE_KEY = "minyako-blog-ui-v3";
   const DEFAULT_CATEGORY = "科研学习/初学手册";
-  const BLOCK_SELECTOR = "TABLE,THEAD,TBODY,TR,TD,TH,SVG,.mermaid,IMG,FIGURE,.article-mark";
+  const BLOCK_SELECTOR = "TABLE,THEAD,TBODY,TR,TD,TH,SVG,.mermaid,IMG,FIGURE,CANVAS,.annotation-blocked,.article-mark";
   const DEFAULT_LLM_QUESTION = (selectedText) => `解释“${selectedText}”在本文中的含义。`;
+  const PDF_JS_SRC = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js";
+  const PDF_JS_WORKER_SRC = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
 
   const state = {
     siteTitle: "Minyako的学习日志",
@@ -30,7 +32,11 @@
       pageId: "",
       selectedText: "",
       pendingRange: null,
-      pendingNoteId: ""
+      pendingNoteId: "",
+      pageNumber: 0,
+      contextSnippet: "",
+      sourceType: "",
+      pageImageDataUrl: ""
     }
   };
 
@@ -70,6 +76,7 @@
   let activeNoteContext = null;
   let lastModalFocus = null;
   let lastWindowScrollY = window.scrollY || 0;
+  let pdfJsPromise = null;
   const chromeState = {
     topbarVisible: true,
     topbarHover: false,
@@ -236,6 +243,10 @@
     });
     document.addEventListener("keydown", (event) => {
       if (event.key !== "Escape" || event.isComposing || !isAnyModalOpen()) {
+        if (event.key === "Escape") {
+          hideSelectionToolbar();
+          closeNotePopover();
+        }
         return;
       }
 
@@ -651,7 +662,11 @@
       });
 
       const articleBody = document.getElementById("articleBody");
-      if (detail.renderedHtml) {
+      const sourceType = getPageSourceType(page);
+      articleBody.dataset.sourceType = sourceType;
+      if (sourceType === "pdf") {
+        await renderPdfArticle(articleBody, detail);
+      } else if (detail.renderedHtml) {
         articleBody.innerHTML = detail.renderedHtml;
       } else {
         articleBody.innerHTML = marked.parse(detail.markdown || "");
@@ -687,6 +702,1020 @@
     if (nodes.length) {
       await mermaid.run({ nodes });
     }
+  }
+
+  async function ensurePdfJs() {
+    if (window.pdfjsLib) {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDF_JS_WORKER_SRC;
+      return window.pdfjsLib;
+    }
+
+    if (!pdfJsPromise) {
+      pdfJsPromise = new Promise((resolve, reject) => {
+        const existing = document.querySelector(`script[data-pdfjs-src="${PDF_JS_SRC}"]`);
+        if (existing) {
+          existing.addEventListener("load", () => {
+            if (window.pdfjsLib) {
+              window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDF_JS_WORKER_SRC;
+              resolve(window.pdfjsLib);
+            } else {
+              reject(new Error("PDF.js 已加载，但未找到可用对象。"));
+            }
+          }, { once: true });
+          existing.addEventListener("error", () => reject(new Error("PDF.js 资源加载失败。")), { once: true });
+          return;
+        }
+
+        const script = document.createElement("script");
+        script.src = PDF_JS_SRC;
+        script.async = true;
+        script.dataset.pdfjsSrc = PDF_JS_SRC;
+        script.onload = () => {
+          if (!window.pdfjsLib) {
+            reject(new Error("PDF.js 已加载，但未找到可用对象。"));
+            return;
+          }
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDF_JS_WORKER_SRC;
+          resolve(window.pdfjsLib);
+        };
+        script.onerror = () => reject(new Error("PDF.js 资源加载失败，请检查网络或 CDN 访问。"));
+        document.head.appendChild(script);
+      });
+    }
+
+    return pdfJsPromise;
+  }
+
+  async function renderPdfArticle(articleBody, detail) {
+    const pdfUrl = detail.pdfUrl || buildPdfUrl(detail.meta);
+    detail.pdfView = detail.pdfView || { scale: 1.18 };
+    articleBody.innerHTML = buildPdfArticleMarkup(detail, pdfUrl);
+
+    const reader = articleBody.querySelector(".pdf-reader");
+    if (!reader) {
+      articleBody.innerHTML = buildPdfFallbackMarkup(detail, pdfUrl, "PDF 页面结构初始化失败，已切换为文本回退视图。");
+      return;
+    }
+
+    try {
+      bindPdfViewerControls(reader, detail, pdfUrl);
+      await renderPdfViewer(reader, detail, pdfUrl);
+    } catch (error) {
+      console.error("Failed to render PDF article.", error);
+      articleBody.innerHTML = buildPdfFallbackMarkup(detail, pdfUrl, error.message || "PDF 页面渲染失败。");
+    }
+  }
+
+  function buildPdfArticleMarkup(detail, pdfUrl) {
+    const sourceName = detail.meta.sourceFileName || "source.pdf";
+    return `
+      <section class="pdf-reader" data-pdf-src="${escapeAttr(pdfUrl)}">
+        <div class="pdf-reader-head annotation-blocked">
+          <div>
+            <h3>PDF 原页阅读</h3>
+            <p>当前页面会以自定义阅读器方式直接渲染 PDF 原页。选中原页文字后，可继续高亮、批注和问 AI。</p>
+          </div>
+          <div class="pdf-reader-actions">
+            <span class="article-chip">文件：${escapeHtml(sourceName)}</span>
+            <a class="ghost-btn small" href="${escapeAttr(pdfUrl)}" target="_blank" rel="noreferrer">打开原始 PDF</a>
+          </div>
+        </div>
+        <div class="pdf-toolbar annotation-blocked">
+          <div class="pdf-toolbar-group">
+            <button class="ghost-btn small" type="button" data-pdf-zoom="out">缩小</button>
+            <button class="ghost-btn small" type="button" data-pdf-zoom="reset">重置</button>
+            <button class="ghost-btn small" type="button" data-pdf-zoom="in">放大</button>
+          </div>
+          <div class="pdf-toolbar-group">
+            <span class="tag" data-pdf-scale-label>缩放 ${Math.round((detail.pdfView?.scale || 1.18) * 100)}%</span>
+            <span class="tag" data-pdf-page-count>准备渲染...</span>
+          </div>
+        </div>
+        <div class="pdf-reader-status annotation-blocked">正在渲染 PDF 页面...</div>
+        <div class="pdf-pages"></div>
+        <details class="pdf-extracted-panel annotation-blocked">
+          <summary>查看辅助提取文本</summary>
+          <div class="pdf-extracted-content">
+            ${renderPlainText(detail.extractedText || "暂时没有提取出可用文本。你仍然可以直接在上方 PDF 页面中选词、批注与提问。")}
+          </div>
+        </details>
+      </section>
+    `;
+  }
+
+  function buildPdfFallbackMarkup(detail, pdfUrl, errorMessage) {
+    return `
+      <section class="pdf-reader pdf-reader-fallback">
+        <div class="pdf-reader-head annotation-blocked">
+          <div>
+            <h3>PDF 回退视图</h3>
+            <p>${escapeHtml(errorMessage || "PDF 页面渲染失败。")}</p>
+          </div>
+          <div class="pdf-reader-actions">
+            <a class="ghost-btn small" href="${escapeAttr(pdfUrl)}" target="_blank" rel="noreferrer">打开原始 PDF</a>
+          </div>
+        </div>
+        <div class="pdf-fallback-body">
+          ${renderPlainText(detail.extractedText || "暂时没有从这份 PDF 中提取出文本内容。")}
+        </div>
+      </section>
+    `;
+  }
+
+  function buildPdfUrl(meta) {
+    if (meta && meta.assetBasePath) {
+      return `${meta.assetBasePath}source.pdf`;
+    }
+    return `/content/pages/${encodeURIComponent(meta.id || "")}/assets/source.pdf`;
+  }
+
+  function renderPlainText(text) {
+    const normalized = String(text || "").trim();
+    if (!normalized) {
+      return '<p class="muted">暂无可展示内容。</p>';
+    }
+
+    return normalized
+      .split(/\n{2,}/)
+      .map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, "<br>")}</p>`)
+      .join("");
+  }
+
+  async function collectAskContext(range) {
+    const context = {
+      pageNumber: 0,
+      contextSnippet: "",
+      sourceType: "",
+      pageImageDataUrl: ""
+    };
+
+    const articleBody = document.getElementById("articleBody");
+    if (!range || !articleBody) {
+      return context;
+    }
+
+    const pdfLayer = getContainerElement(range.startContainer)?.closest(".pdf-text-layer");
+    if (pdfLayer) {
+      const pageNode = pdfLayer.closest(".pdf-page");
+      const pageNumber = Number(pageNode?.dataset.pageNumber || pdfLayer.dataset.pageNumber || 0);
+      const pageText = String(pageNode?.dataset.pageText || pdfLayer.dataset.pageText || "").trim();
+      const localSnippet = extractSelectionNeighborhood(pageText, range.toString().trim(), 900);
+      const pageImageDataUrl = await capturePdfSelectionImage(pageNode, range);
+      return {
+        pageNumber,
+        contextSnippet: localSnippet || pageText.slice(0, 2200),
+        sourceType: "pdf",
+        pageImageDataUrl
+      };
+    }
+
+    const selectedText = range.toString().trim();
+    const articleText = articleBody.textContent || "";
+    return {
+      pageNumber: 0,
+      contextSnippet: extractSelectionNeighborhood(articleText, selectedText, 900),
+      sourceType: "markdown",
+      pageImageDataUrl: ""
+    };
+  }
+
+  function extractSelectionNeighborhood(text, selectedText, radius = 800) {
+    const normalizedText = normalizeContextText(text);
+    const normalizedSelected = normalizeContextText(selectedText);
+    if (!normalizedText) {
+      return "";
+    }
+    if (!normalizedSelected) {
+      return normalizedText.slice(0, radius * 2);
+    }
+
+    const index = normalizedText.indexOf(normalizedSelected);
+    if (index < 0) {
+      return normalizedText.slice(0, radius * 2);
+    }
+
+    const start = Math.max(0, index - radius);
+    const end = Math.min(normalizedText.length, index + normalizedSelected.length + radius);
+    return normalizedText.slice(start, end).trim();
+  }
+
+  function normalizeContextText(text) {
+    return String(text || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  async function capturePdfSelectionImage(pageNode, range) {
+    if (!pageNode || !range) {
+      return "";
+    }
+
+    const canvas = pageNode.querySelector(".pdf-page-canvas");
+    if (!canvas) {
+      return "";
+    }
+
+    const pageRect = canvas.getBoundingClientRect();
+    const rangeRect = range.getBoundingClientRect();
+    if (!pageRect.width || !pageRect.height) {
+      return "";
+    }
+    if (!rangeRect.width || !rangeRect.height) {
+      return canvas.toDataURL("image/jpeg", 0.82);
+    }
+
+    const marginX = Math.max(180, rangeRect.width * 1.75);
+    const marginY = Math.max(220, rangeRect.height * 3.2);
+    const cropLeftCss = clamp(rangeRect.left - pageRect.left - marginX, 0, pageRect.width);
+    const cropTopCss = clamp(rangeRect.top - pageRect.top - marginY, 0, pageRect.height);
+    const cropRightCss = clamp(rangeRect.right - pageRect.left + marginX, 0, pageRect.width);
+    const cropBottomCss = clamp(rangeRect.bottom - pageRect.top + marginY, 0, pageRect.height);
+    const cropWidthCss = Math.max(40, cropRightCss - cropLeftCss);
+    const cropHeightCss = Math.max(40, cropBottomCss - cropTopCss);
+
+    const scaleX = canvas.width / pageRect.width;
+    const scaleY = canvas.height / pageRect.height;
+    const sx = Math.max(0, Math.floor(cropLeftCss * scaleX));
+    const sy = Math.max(0, Math.floor(cropTopCss * scaleY));
+    const sw = Math.min(canvas.width - sx, Math.ceil(cropWidthCss * scaleX));
+    const sh = Math.min(canvas.height - sy, Math.ceil(cropHeightCss * scaleY));
+    if (sw <= 0 || sh <= 0) {
+      return "";
+    }
+
+    const maxDimension = 1500;
+    const ratio = Math.min(1, maxDimension / Math.max(sw, sh));
+    const targetWidth = Math.max(1, Math.round(sw * ratio));
+    const targetHeight = Math.max(1, Math.round(sh * ratio));
+    const exportCanvas = document.createElement("canvas");
+    exportCanvas.width = targetWidth;
+    exportCanvas.height = targetHeight;
+    const exportContext = exportCanvas.getContext("2d");
+    if (!exportContext) {
+      return "";
+    }
+
+    exportContext.drawImage(canvas, sx, sy, sw, sh, 0, 0, targetWidth, targetHeight);
+    return exportCanvas.toDataURL("image/jpeg", 0.84);
+  }
+
+  function bindPdfViewerControls(reader, detail, pdfUrl) {
+    reader.querySelectorAll("[data-pdf-zoom]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const mode = button.getAttribute("data-pdf-zoom");
+        const current = Number(detail.pdfView?.scale || 1.18);
+        let next = current;
+        if (mode === "out") {
+          next = clamp(current - 0.12, 0.72, 2.2);
+        } else if (mode === "in") {
+          next = clamp(current + 0.12, 0.72, 2.2);
+        } else {
+          next = 1.18;
+        }
+        detail.pdfView = { ...detail.pdfView, scale: next };
+        await renderPdfViewer(reader, detail, pdfUrl);
+      });
+    });
+  }
+
+  async function getPdfDocument(detail, pdfUrl) {
+    if (!detail.pdfDocumentPromise) {
+      detail.pdfDocumentPromise = ensurePdfJs().then((pdfjsLib) => {
+        const task = pdfjsLib.getDocument({
+          url: pdfUrl,
+          useSystemFonts: true
+        });
+        return task.promise;
+      });
+    }
+    return detail.pdfDocumentPromise;
+  }
+
+  async function renderPdfViewer(reader, detail, pdfUrl) {
+    const pdfDoc = await getPdfDocument(detail, pdfUrl);
+    const status = reader.querySelector(".pdf-reader-status");
+    const pagesContainer = reader.querySelector(".pdf-pages");
+    const scale = Number(detail.pdfView?.scale || 1.18) || 1.18;
+    const scaleLabel = reader.querySelector("[data-pdf-scale-label]");
+    const pageCountLabel = reader.querySelector("[data-pdf-page-count]");
+    if (scaleLabel) {
+      scaleLabel.textContent = `缩放 ${Math.round(scale * 100)}%`;
+    }
+    if (pageCountLabel) {
+      pageCountLabel.textContent = `共 ${pdfDoc.numPages} 页`;
+    }
+    if (status) {
+      status.textContent = "正在渲染 PDF 页面...";
+    }
+
+    pagesContainer.innerHTML = "";
+    const pdfjsLib = await ensurePdfJs();
+    for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber += 1) {
+      const pageNode = createPdfPageShell(pageNumber);
+      pagesContainer.appendChild(pageNode);
+      await renderPdfPageNode(pdfjsLib, pdfDoc, pageNode, pageNumber, scale, detail);
+    }
+
+    if (status) {
+      status.textContent = `PDF 共 ${pdfDoc.numPages} 页，已完成渲染。选中原页文字即可继续高亮、批注或问 AI。`;
+    }
+  }
+
+  function createPdfPageShell(pageNumber) {
+    const pageNode = document.createElement("section");
+    pageNode.className = "pdf-page";
+    pageNode.dataset.pageNumber = String(pageNumber);
+    pageNode.innerHTML = `
+      <div class="pdf-page-label annotation-blocked">第 ${pageNumber} 页</div>
+      <div class="pdf-page-stage">
+        <canvas class="pdf-page-canvas"></canvas>
+        <div class="pdf-mark-layer"></div>
+        <div class="pdf-text-layer textLayer"></div>
+        <div class="pdf-note-badges"></div>
+      </div>
+    `;
+    return pageNode;
+  }
+
+  async function renderPdfPageNode(pdfjsLib, pdfDoc, pageNode, pageNumber, scale, detail) {
+    const page = await pdfDoc.getPage(pageNumber);
+    const viewport = page.getViewport({ scale });
+    const stage = pageNode.querySelector(".pdf-page-stage");
+    const canvas = pageNode.querySelector(".pdf-page-canvas");
+    const textLayer = pageNode.querySelector(".pdf-text-layer");
+    const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+    const renderViewport = page.getViewport({ scale: scale * pixelRatio });
+    const context = canvas.getContext("2d", { alpha: false });
+
+    pageNode.style.width = `${Math.ceil(viewport.width)}px`;
+    stage.style.width = `${Math.ceil(viewport.width)}px`;
+    stage.style.height = `${Math.ceil(viewport.height)}px`;
+    canvas.width = Math.ceil(renderViewport.width);
+    canvas.height = Math.ceil(renderViewport.height);
+    canvas.style.width = `${Math.ceil(viewport.width)}px`;
+    canvas.style.height = `${Math.ceil(viewport.height)}px`;
+    textLayer.style.width = `${Math.ceil(viewport.width)}px`;
+    textLayer.style.height = `${Math.ceil(viewport.height)}px`;
+    textLayer.dataset.pageNumber = String(pageNumber);
+
+    await page.render({
+      canvasContext: context,
+      viewport: renderViewport
+    }).promise;
+
+    const needsTextLayer =
+      textLayer.childElementCount === 0 ||
+      textLayer.dataset.textReady !== "true";
+
+    if (needsTextLayer) {
+      textLayer.innerHTML = "";
+      await renderPdfTextLayer(pdfjsLib, page, textLayer, viewport);
+      textLayer.dataset.textReady = "true";
+    }
+    renderPdfPageMarks(pageNode, detail, pageNumber);
+  }
+
+  async function renderPdfTextLayer(pdfjsLib, page, container, viewport) {
+    const textContent = await page.getTextContent();
+    const pageText = buildPdfPageText(textContent);
+    container.dataset.pageText = pageText;
+    const pageNode = container.closest(".pdf-page");
+    if (pageNode) {
+      pageNode.dataset.pageText = pageText;
+    }
+
+    if (typeof pdfjsLib.renderTextLayer === "function") {
+      const task = pdfjsLib.renderTextLayer({
+        container,
+        textContent,
+        textContentSource: textContent,
+        viewport,
+        textDivs: []
+      });
+      if (task && typeof task.promise?.then === "function") {
+        await task.promise;
+        return;
+      }
+      if (task && typeof task.then === "function") {
+        await task;
+        return;
+      }
+    }
+
+    if (typeof pdfjsLib.TextLayer === "function") {
+      const textLayer = new pdfjsLib.TextLayer({
+        container,
+        textContentSource: textContent,
+        viewport
+      });
+      const result = textLayer.render();
+      if (result && typeof result.then === "function") {
+        await result;
+      }
+      return;
+    }
+
+    throw new Error("当前 PDF.js 版本没有可用的文本层接口。");
+  }
+
+  function buildPdfPageText(textContent) {
+    if (!textContent || !Array.isArray(textContent.items)) {
+      return "";
+    }
+
+    return textContent.items
+      .map((item) => (item && typeof item.str === "string" ? item.str : ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function renderPdfPageMarks(pageNode, detail, pageNumber) {
+    const markLayer = pageNode.querySelector(".pdf-mark-layer");
+    const badgeLayer = pageNode.querySelector(".pdf-note-badges");
+    if (!markLayer || !badgeLayer || !detail) {
+      return;
+    }
+
+    markLayer.innerHTML = "";
+    badgeLayer.innerHTML = "";
+    const notes = Object.values(detail.notes || {}).filter((note) => getPdfNotePageNumber(note) === pageNumber);
+    notes.forEach((note) => {
+      const rects = getPdfNoteRects(note);
+      if (!rects.length) {
+        return;
+      }
+
+      rects.forEach((rect) => {
+        const node = document.createElement("div");
+        const kindClass = note.kind === "highlight" ? "pdf-mark-highlight" : "pdf-mark-annotation";
+        const llmClass = note.source === "llm" ? " pdf-mark-llm" : "";
+        node.className = `pdf-mark ${kindClass}${llmClass}`;
+        node.dataset.noteId = note.id;
+        applyPdfRectStyle(node, rect);
+        markLayer.appendChild(node);
+      });
+
+      if (note.kind !== "highlight") {
+        const badge = document.createElement("button");
+        badge.type = "button";
+        badge.className = `pdf-note-badge ${note.source === "llm" ? "llm" : ""}`;
+        badge.dataset.noteId = note.id;
+        badge.textContent = note.source === "llm" ? "AI" : "注";
+        positionPdfBadge(badge, rects[0]);
+        badge.addEventListener("click", (event) => {
+          event.stopPropagation();
+          openNoteEditor(badge, note.id);
+        });
+        badgeLayer.appendChild(badge);
+      }
+    });
+  }
+
+  function applyPdfRectStyle(element, rect) {
+    element.style.left = `${rect.left * 100}%`;
+    element.style.top = `${rect.top * 100}%`;
+    element.style.width = `${rect.width * 100}%`;
+    element.style.height = `${rect.height * 100}%`;
+  }
+
+  function positionPdfBadge(element, rect) {
+    const left = clamp(rect.left + rect.width - 0.02, 0.01, 0.96);
+    const top = clamp(rect.top - 0.035, 0.01, 0.94);
+    element.style.left = `${left * 100}%`;
+    element.style.top = `${top * 100}%`;
+  }
+
+  function getPdfNotePageNumber(note) {
+    return Number(note?.pageNumber || note?.pdfPageNumber || 0);
+  }
+
+  function getPdfNoteRects(note) {
+    if (Array.isArray(note?.rects)) {
+      return note.rects;
+    }
+    if (Array.isArray(note?.pdfRects)) {
+      return note.pdfRects;
+    }
+    return [];
+  }
+
+  async function ensurePdfJs() {
+    if (window.pdfjsLib) {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDF_JS_WORKER_SRC;
+      return window.pdfjsLib;
+    }
+
+    if (!pdfJsPromise) {
+      pdfJsPromise = new Promise((resolve, reject) => {
+        const existing = document.querySelector(`script[data-pdfjs-src="${PDF_JS_SRC}"]`);
+        if (existing) {
+          existing.addEventListener("load", () => {
+            if (!window.pdfjsLib) {
+              reject(new Error("PDF.js 已加载，但未找到可用对象。"));
+              return;
+            }
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDF_JS_WORKER_SRC;
+            resolve(window.pdfjsLib);
+          }, { once: true });
+          existing.addEventListener("error", () => reject(new Error("PDF.js 资源加载失败。")), { once: true });
+          return;
+        }
+
+        const script = document.createElement("script");
+        script.src = PDF_JS_SRC;
+        script.async = true;
+        script.dataset.pdfjsSrc = PDF_JS_SRC;
+        script.onload = () => {
+          if (!window.pdfjsLib) {
+            reject(new Error("PDF.js 已加载，但未找到可用对象。"));
+            return;
+          }
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDF_JS_WORKER_SRC;
+          resolve(window.pdfjsLib);
+        };
+        script.onerror = () => reject(new Error("PDF.js 资源加载失败，请检查网络或改为本地部署。"));
+        document.head.appendChild(script);
+      });
+    }
+
+    return pdfJsPromise;
+  }
+
+  async function renderPdfArticle(articleBody, detail) {
+    const pdfUrl = detail.pdfUrl || buildPdfUrl(detail.meta);
+    detail.pdfUrl = pdfUrl;
+    detail.pdfView = detail.pdfView || { scale: 1.18 };
+    detail.pdfRenderToken = (detail.pdfRenderToken || 0) + 1;
+    articleBody.innerHTML = buildPdfArticleMarkup(detail, pdfUrl);
+
+    const reader = articleBody.querySelector(".pdf-reader");
+    if (!reader) {
+      articleBody.innerHTML = buildPdfFallbackMarkup(detail, pdfUrl, "PDF 阅读器初始化失败，已切换到文本回退视图。");
+      return;
+    }
+
+    try {
+      bindPdfViewerControls(reader, detail, pdfUrl);
+      await renderPdfViewer(reader, detail, pdfUrl);
+    } catch (error) {
+      console.error("Failed to render PDF article.", error);
+      articleBody.innerHTML = buildPdfFallbackMarkup(detail, pdfUrl, error.message || "PDF 页面渲染失败。");
+    }
+  }
+
+  function buildPdfArticleMarkup(detail, pdfUrl) {
+    const sourceName = detail.meta?.sourceFileName || "source.pdf";
+    const scale = Math.round((detail.pdfView?.scale || 1.18) * 100);
+    return `
+      <section class="pdf-reader" data-pdf-src="${escapeAttr(pdfUrl)}">
+        <div class="pdf-reader-head annotation-blocked">
+          <div>
+            <h3>PDF 原页阅读</h3>
+            <p>这里会直接在页面中渲染 PDF 原页。你可以在原文上选词、高亮、写批注，并结合上下文向 AI 提问。</p>
+          </div>
+          <div class="pdf-reader-actions">
+            <span class="article-chip">文件：${escapeHtml(sourceName)}</span>
+            <a class="ghost-btn small" href="${escapeAttr(pdfUrl)}" target="_blank" rel="noreferrer">打开原始 PDF</a>
+          </div>
+        </div>
+        <div class="pdf-toolbar annotation-blocked">
+          <div class="pdf-toolbar-group">
+            <button class="ghost-btn small" type="button" data-pdf-zoom="out">缩小</button>
+            <button class="ghost-btn small" type="button" data-pdf-zoom="reset">重置</button>
+            <button class="ghost-btn small" type="button" data-pdf-zoom="in">放大</button>
+          </div>
+          <div class="pdf-toolbar-group">
+            <span class="tag" data-pdf-scale-label>缩放 ${scale}%</span>
+            <span class="tag" data-pdf-page-count>准备渲染...</span>
+          </div>
+        </div>
+        <div class="pdf-reader-status annotation-blocked">正在渲染 PDF 页面...</div>
+        <div class="pdf-pages"></div>
+        <details class="pdf-extracted-panel annotation-blocked">
+          <summary>查看辅助提取文本</summary>
+          <div class="pdf-extracted-content">
+            ${renderPlainText(detail.extractedText || "暂时没有提取到可用文本，你仍然可以直接在上方 PDF 原页中选择内容并进行批注。")}
+          </div>
+        </details>
+      </section>
+    `;
+  }
+
+  function buildPdfFallbackMarkup(detail, pdfUrl, errorMessage) {
+    return `
+      <section class="pdf-reader pdf-reader-fallback">
+        <div class="pdf-reader-head annotation-blocked">
+          <div>
+            <h3>PDF 回退视图</h3>
+            <p>${escapeHtml(errorMessage || "PDF 页面渲染失败。")}</p>
+          </div>
+          <div class="pdf-reader-actions">
+            <a class="ghost-btn small" href="${escapeAttr(pdfUrl)}" target="_blank" rel="noreferrer">打开原始 PDF</a>
+          </div>
+        </div>
+        <div class="pdf-fallback-body">
+          ${renderPlainText(detail.extractedText || "暂时无法渲染原始 PDF，这里展示提取出的文本内容。")}
+        </div>
+      </section>
+    `;
+  }
+
+  function buildPdfUrl(meta) {
+    if (meta && meta.assetBasePath) {
+      return `${meta.assetBasePath}source.pdf`;
+    }
+    return `/content/pages/${encodeURIComponent(meta?.id || "")}/assets/source.pdf`;
+  }
+
+  function renderPlainText(text) {
+    const normalized = String(text || "").trim();
+    if (!normalized) {
+      return '<p class="muted">暂无可展示内容。</p>';
+    }
+
+    return normalized
+      .split(/\n{2,}/)
+      .map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, "<br>")}</p>`)
+      .join("");
+  }
+
+  async function collectAskContext(range) {
+    const context = {
+      pageNumber: 0,
+      contextSnippet: "",
+      sourceType: "",
+      pageImageDataUrl: ""
+    };
+
+    const articleBody = document.getElementById("articleBody");
+    if (!range || !articleBody) {
+      return context;
+    }
+
+    const pdfLayer = getContainerElement(range.startContainer)?.closest(".pdf-text-layer");
+    if (pdfLayer) {
+      const pageNode = pdfLayer.closest(".pdf-page");
+      const pageNumber = Number(pageNode?.dataset.pageNumber || pdfLayer.dataset.pageNumber || 0);
+      const pageText = String(pageNode?.dataset.pageText || pdfLayer.dataset.pageText || "").trim();
+      const selectedText = range.toString().trim();
+      const localSnippet = extractSelectionNeighborhood(pageText, selectedText, 900);
+      const pageImageDataUrl = await capturePdfSelectionImage(pageNode, range);
+      return {
+        pageNumber,
+        contextSnippet: localSnippet || pageText.slice(0, 2200),
+        sourceType: "pdf",
+        pageImageDataUrl
+      };
+    }
+
+    const selectedText = range.toString().trim();
+    const articleText = articleBody.textContent || "";
+    return {
+      pageNumber: 0,
+      contextSnippet: extractSelectionNeighborhood(articleText, selectedText, 900),
+      sourceType: "markdown",
+      pageImageDataUrl: ""
+    };
+  }
+
+  function extractSelectionNeighborhood(text, selectedText, radius = 800) {
+    const normalizedText = normalizeContextText(text);
+    const normalizedSelected = normalizeContextText(selectedText);
+    if (!normalizedText) {
+      return "";
+    }
+    if (!normalizedSelected) {
+      return normalizedText.slice(0, radius * 2);
+    }
+
+    const index = normalizedText.indexOf(normalizedSelected);
+    if (index < 0) {
+      return normalizedText.slice(0, radius * 2);
+    }
+
+    const start = Math.max(0, index - radius);
+    const end = Math.min(normalizedText.length, index + normalizedSelected.length + radius);
+    return normalizedText.slice(start, end).trim();
+  }
+
+  function normalizeContextText(text) {
+    return String(text || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  async function capturePdfSelectionImage(pageNode, range) {
+    if (!pageNode || !range) {
+      return "";
+    }
+
+    const canvas = pageNode.querySelector(".pdf-page-canvas");
+    if (!canvas) {
+      return "";
+    }
+
+    const pageRect = canvas.getBoundingClientRect();
+    const rangeRect = range.getBoundingClientRect();
+    if (!pageRect.width || !pageRect.height) {
+      return "";
+    }
+    if (!rangeRect.width || !rangeRect.height) {
+      return canvas.toDataURL("image/jpeg", 0.82);
+    }
+
+    const marginX = Math.max(180, rangeRect.width * 1.75);
+    const marginY = Math.max(220, rangeRect.height * 3.2);
+    const cropLeftCss = clamp(rangeRect.left - pageRect.left - marginX, 0, pageRect.width);
+    const cropTopCss = clamp(rangeRect.top - pageRect.top - marginY, 0, pageRect.height);
+    const cropRightCss = clamp(rangeRect.right - pageRect.left + marginX, 0, pageRect.width);
+    const cropBottomCss = clamp(rangeRect.bottom - pageRect.top + marginY, 0, pageRect.height);
+    const cropWidthCss = Math.max(40, cropRightCss - cropLeftCss);
+    const cropHeightCss = Math.max(40, cropBottomCss - cropTopCss);
+
+    const scaleX = canvas.width / pageRect.width;
+    const scaleY = canvas.height / pageRect.height;
+    const sx = Math.max(0, Math.floor(cropLeftCss * scaleX));
+    const sy = Math.max(0, Math.floor(cropTopCss * scaleY));
+    const sw = Math.min(canvas.width - sx, Math.ceil(cropWidthCss * scaleX));
+    const sh = Math.min(canvas.height - sy, Math.ceil(cropHeightCss * scaleY));
+    if (sw <= 0 || sh <= 0) {
+      return "";
+    }
+
+    const maxDimension = 1500;
+    const ratio = Math.min(1, maxDimension / Math.max(sw, sh));
+    const targetWidth = Math.max(1, Math.round(sw * ratio));
+    const targetHeight = Math.max(1, Math.round(sh * ratio));
+    const exportCanvas = document.createElement("canvas");
+    exportCanvas.width = targetWidth;
+    exportCanvas.height = targetHeight;
+    const exportContext = exportCanvas.getContext("2d");
+    if (!exportContext) {
+      return "";
+    }
+
+    exportContext.drawImage(canvas, sx, sy, sw, sh, 0, 0, targetWidth, targetHeight);
+    return exportCanvas.toDataURL("image/jpeg", 0.84);
+  }
+
+  function bindPdfViewerControls(reader, detail, pdfUrl) {
+    reader.querySelectorAll("[data-pdf-zoom]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const mode = button.getAttribute("data-pdf-zoom");
+        const current = Number(detail.pdfView?.scale || 1.18);
+        let next = current;
+        if (mode === "out") {
+          next = clamp(current - 0.12, 0.72, 2.2);
+        } else if (mode === "in") {
+          next = clamp(current + 0.12, 0.72, 2.2);
+        } else {
+          next = 1.18;
+        }
+        detail.pdfView = { ...detail.pdfView, scale: next };
+        await renderPdfViewer(reader, detail, pdfUrl);
+      });
+    });
+  }
+
+  async function getPdfDocument(detail, pdfUrl) {
+    if (!detail.pdfDocumentPromise) {
+      detail.pdfDocumentPromise = ensurePdfJs().then((pdfjsLib) => {
+        const task = pdfjsLib.getDocument({
+          url: pdfUrl,
+          useSystemFonts: true
+        });
+        return task.promise;
+      });
+    }
+    return detail.pdfDocumentPromise;
+  }
+
+  async function renderPdfViewer(reader, detail, pdfUrl) {
+    const renderToken = (detail.pdfRenderToken || 0) + 1;
+    detail.pdfRenderToken = renderToken;
+    const status = reader.querySelector(".pdf-reader-status");
+    const pagesContainer = reader.querySelector(".pdf-pages");
+    const scale = Number(detail.pdfView?.scale || 1.18) || 1.18;
+    const scaleLabel = reader.querySelector("[data-pdf-scale-label]");
+    const pageCountLabel = reader.querySelector("[data-pdf-page-count]");
+
+    if (scaleLabel) {
+      scaleLabel.textContent = `缩放 ${Math.round(scale * 100)}%`;
+    }
+    if (status) {
+      status.textContent = "正在渲染 PDF 页面...";
+    }
+    if (pagesContainer) {
+      pagesContainer.innerHTML = "";
+    }
+
+    const [pdfjsLib, pdfDoc] = await Promise.all([
+      ensurePdfJs(),
+      getPdfDocument(detail, pdfUrl)
+    ]);
+    if (detail.pdfRenderToken !== renderToken) {
+      return;
+    }
+
+    if (pageCountLabel) {
+      pageCountLabel.textContent = `共 ${pdfDoc.numPages} 页`;
+    }
+
+    for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber += 1) {
+      if (detail.pdfRenderToken !== renderToken) {
+        return;
+      }
+      const pageNode = createPdfPageShell(pageNumber);
+      pagesContainer.appendChild(pageNode);
+      await renderPdfPageNode(pdfjsLib, pdfDoc, pageNode, pageNumber, scale, detail);
+    }
+
+    if (detail.pdfRenderToken !== renderToken) {
+      return;
+    }
+
+    if (status) {
+      status.textContent = `PDF 共 ${pdfDoc.numPages} 页，已完成渲染。现在可以直接在原页上选词、高亮、批注或询问 AI。`;
+    }
+  }
+
+  function createPdfPageShell(pageNumber) {
+    const pageNode = document.createElement("section");
+    pageNode.className = "pdf-page";
+    pageNode.dataset.pageNumber = String(pageNumber);
+    pageNode.innerHTML = `
+      <div class="pdf-page-label annotation-blocked">第 ${pageNumber} 页</div>
+      <div class="pdf-page-stage">
+        <canvas class="pdf-page-canvas"></canvas>
+        <div class="pdf-mark-layer"></div>
+        <div class="pdf-text-layer textLayer"></div>
+        <div class="pdf-note-badges"></div>
+      </div>
+    `;
+    return pageNode;
+  }
+
+  async function renderPdfPageNode(pdfjsLib, pdfDoc, pageNode, pageNumber, scale, detail) {
+    const page = await pdfDoc.getPage(pageNumber);
+    const viewport = page.getViewport({ scale });
+    const stage = pageNode.querySelector(".pdf-page-stage");
+    const canvas = pageNode.querySelector(".pdf-page-canvas");
+    const textLayer = pageNode.querySelector(".pdf-text-layer");
+    const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+    const renderViewport = page.getViewport({ scale: scale * pixelRatio });
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!stage || !canvas || !textLayer || !context) {
+      return;
+    }
+
+    pageNode.style.width = `${Math.ceil(viewport.width)}px`;
+    stage.style.width = `${Math.ceil(viewport.width)}px`;
+    stage.style.height = `${Math.ceil(viewport.height)}px`;
+    canvas.width = Math.ceil(renderViewport.width);
+    canvas.height = Math.ceil(renderViewport.height);
+    canvas.style.width = `${Math.ceil(viewport.width)}px`;
+    canvas.style.height = `${Math.ceil(viewport.height)}px`;
+
+    textLayer.innerHTML = "";
+    textLayer.style.width = `${Math.ceil(viewport.width)}px`;
+    textLayer.style.height = `${Math.ceil(viewport.height)}px`;
+    textLayer.dataset.pageNumber = String(pageNumber);
+
+    await page.render({
+      canvasContext: context,
+      viewport: renderViewport
+    }).promise;
+
+    await renderPdfTextLayer(pdfjsLib, page, textLayer, viewport);
+    renderPdfPageMarks(pageNode, detail, pageNumber);
+  }
+
+  async function renderPdfTextLayer(pdfjsLib, page, container, viewport) {
+    const textContent = await page.getTextContent();
+    const pageText = buildPdfPageText(textContent);
+    container.dataset.pageText = pageText;
+    const pageNode = container.closest(".pdf-page");
+    if (pageNode) {
+      pageNode.dataset.pageText = pageText;
+    }
+
+    if (typeof pdfjsLib.renderTextLayer === "function") {
+      const task = pdfjsLib.renderTextLayer({
+        container,
+        textContent,
+        textContentSource: textContent,
+        viewport,
+        textDivs: []
+      });
+      if (task && typeof task.promise?.then === "function") {
+        await task.promise;
+        return;
+      }
+      if (task && typeof task.then === "function") {
+        await task;
+        return;
+      }
+    }
+
+    if (typeof pdfjsLib.TextLayer === "function") {
+      const textLayer = new pdfjsLib.TextLayer({
+        container,
+        textContentSource: textContent,
+        viewport
+      });
+      const result = textLayer.render();
+      if (result && typeof result.then === "function") {
+        await result;
+      }
+      return;
+    }
+
+    throw new Error("当前 PDF.js 版本没有可用的文本层接口。");
+  }
+
+  function buildPdfPageText(textContent) {
+    if (!textContent || !Array.isArray(textContent.items)) {
+      return "";
+    }
+
+    return textContent.items
+      .map((item) => (item && typeof item.str === "string" ? item.str : ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function renderPdfPageMarks(pageNode, detail, pageNumber) {
+    const markLayer = pageNode.querySelector(".pdf-mark-layer");
+    const badgeLayer = pageNode.querySelector(".pdf-note-badges");
+    if (!markLayer || !badgeLayer || !detail) {
+      return;
+    }
+
+    markLayer.innerHTML = "";
+    badgeLayer.innerHTML = "";
+    const notes = Object.values(detail.notes || {}).filter((note) => getPdfNotePageNumber(note) === pageNumber);
+    notes.forEach((note) => {
+      const rects = getPdfNoteRects(note);
+      if (!rects.length) {
+        return;
+      }
+
+      rects.forEach((rect) => {
+        const node = document.createElement("div");
+        const kindClass = note.kind === "highlight" ? "pdf-mark-highlight" : "pdf-mark-annotation";
+        const llmClass = note.source === "llm" ? " pdf-mark-llm" : "";
+        node.className = `pdf-mark ${kindClass}${llmClass}`;
+        node.dataset.noteId = note.id;
+        applyPdfRectStyle(node, rect);
+        markLayer.appendChild(node);
+      });
+
+      if (note.kind === "highlight") {
+        return;
+      }
+
+      const badge = document.createElement("button");
+      badge.type = "button";
+      badge.className = `pdf-note-badge ${note.source === "llm" ? "llm" : ""}`;
+      badge.dataset.noteId = note.id;
+      badge.textContent = note.source === "llm" ? "AI" : "注";
+      positionPdfBadge(badge, rects[0]);
+      badge.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openNoteEditor(badge, note.id);
+      });
+      badgeLayer.appendChild(badge);
+    });
+  }
+
+  function applyPdfRectStyle(element, rect) {
+    element.style.left = `${rect.left * 100}%`;
+    element.style.top = `${rect.top * 100}%`;
+    element.style.width = `${rect.width * 100}%`;
+    element.style.height = `${rect.height * 100}%`;
+  }
+
+  function positionPdfBadge(element, rect) {
+    const left = clamp(rect.left + rect.width - 0.02, 0.02, 0.96);
+    const top = clamp(rect.top - 0.035, 0.02, 0.94);
+    element.style.left = `${left * 100}%`;
+    element.style.top = `${top * 100}%`;
+  }
+
+  function getPdfNotePageNumber(note) {
+    return Number(note?.pageNumber || note?.pdfPageNumber || 0);
+  }
+
+  function getPdfNoteRects(note) {
+    if (Array.isArray(note?.rects)) {
+      return note.rects;
+    }
+    if (Array.isArray(note?.pdfRects)) {
+      return note.pdfRects;
+    }
+    return [];
   }
 
   async function fetchPageDetail(pageId) {
@@ -748,7 +1777,7 @@
   function openAskModal(selectedText, pageId) {
     state.askContext.pageId = pageId;
     state.askContext.selectedText = selectedText;
-    askSelectedText.textContent = selectedText;
+    askSelectedText.textContent = buildAskSelectionLabel();
     askQuestionInput.value = DEFAULT_LLM_QUESTION(selectedText);
     updateAskUi(false);
     openModal(askModal, askQuestionInput);
@@ -760,6 +1789,10 @@
     state.askContext.selectedText = "";
     state.askContext.pendingRange = null;
     state.askContext.pendingNoteId = "";
+    state.askContext.pageNumber = 0;
+    state.askContext.contextSnippet = "";
+    state.askContext.sourceType = "";
+    state.askContext.pageImageDataUrl = "";
     updateAskUi(false);
   }
 
@@ -768,6 +1801,20 @@
       return;
     }
     askQuestionInput.value = DEFAULT_LLM_QUESTION(state.askContext.selectedText);
+  }
+
+  function buildAskSelectionLabel() {
+    const selected = state.askContext.selectedText || "";
+    if (!selected) {
+      return "";
+    }
+
+    if (state.askContext.sourceType === "pdf" && state.askContext.pageNumber > 0) {
+      const imageHint = state.askContext.pageImageDataUrl ? "，将附带原页截图" : "";
+      return `${selected}\n\n当前来源：PDF 原页第 ${state.askContext.pageNumber} 页${imageHint}`;
+    }
+
+    return selected;
   }
 
   async function importMarkdownFile() {
@@ -985,7 +2032,7 @@
     activeRange = null;
   }
 
-  function openAskModalFromSelection() {
+  async function openAskModalFromSelection() {
     if (!activeRange || !state.ui.activePageId) {
       return;
     }
@@ -996,11 +2043,17 @@
       return;
     }
 
+    const selectionContext = await collectAskContext(rangeForAsk);
+
     const selection = window.getSelection();
     selection.removeAllRanges();
     hideSelectionToolbar();
     state.askContext.pendingRange = rangeForAsk;
     state.askContext.pendingNoteId = "";
+    state.askContext.pageNumber = selectionContext.pageNumber;
+    state.askContext.contextSnippet = selectionContext.contextSnippet;
+    state.askContext.sourceType = selectionContext.sourceType;
+    state.askContext.pageImageDataUrl = selectionContext.pageImageDataUrl || "";
     openAskModal(selectedText, state.ui.activePageId);
   }
 
@@ -1027,7 +2080,11 @@
     const payload = {
       pageId: state.askContext.pageId,
       selectedText: state.askContext.selectedText,
-      question: askQuestionInput.value.trim() || DEFAULT_LLM_QUESTION(state.askContext.selectedText)
+      question: askQuestionInput.value.trim() || DEFAULT_LLM_QUESTION(state.askContext.selectedText),
+      contextPageNumber: state.askContext.pageNumber || 0,
+      contextSnippet: state.askContext.contextSnippet || "",
+      contextSource: state.askContext.sourceType || "",
+      contextPageImageDataUrl: state.askContext.pageImageDataUrl || ""
     };
 
     try {
@@ -1097,9 +2154,14 @@
       element
     };
 
-    notePopoverTitle.textContent = detail.notes[noteId].source === "llm" ? "LLM 批注" : "批注编辑";
-    noteQuote.textContent = detail.notes[noteId].quote || element.textContent.trim();
-    noteEditor.value = detail.notes[noteId].text || "";
+    const note = detail.notes[noteId];
+    if (note.kind === "highlight") {
+      notePopoverTitle.textContent = "高亮";
+    } else {
+      notePopoverTitle.textContent = note.source === "llm" ? "LLM 批注" : "批注编辑";
+    }
+    noteQuote.textContent = note.quote || element.textContent.trim();
+    noteEditor.value = note.text || "";
     updateNotePreview();
 
     notePopover.classList.remove("hidden");
@@ -1142,8 +2204,11 @@
     }
 
     delete detail.notes[activeNoteContext.noteId];
-    unwrapElement(activeNoteContext.element);
+    if (!isPdfPageDetail(detail) && activeNoteContext.element) {
+      unwrapElement(activeNoteContext.element);
+    }
     await persistCurrentPageFromDom();
+    refreshPdfNoteLayers(detail);
     renderAnnotationSummary(detail);
     closeNotePopover();
   }
@@ -1165,7 +2230,7 @@
       return;
     }
 
-    detail.renderedHtml = articleBody.innerHTML;
+    detail.renderedHtml = isPdfPageDetail(detail) ? "" : articleBody.innerHTML;
     let response;
     try {
       response = await fetch(`/api/pages/${encodeURIComponent(state.ui.activePageId)}/save`, {
@@ -1199,7 +2264,7 @@
     if (!selectionToolbar.contains(target)) {
       hideSelectionToolbar();
     }
-    if (!notePopover.contains(target) && !target.closest(".article-annotation")) {
+    if (!notePopover.contains(target) && !target.closest(".article-annotation") && !target.closest(".pdf-note-badge")) {
       closeNotePopover();
     }
   }
@@ -1302,8 +2367,19 @@
     return Math.min(Math.max(value, min), max);
   }
 
+  function getPageSourceType(page) {
+    const declared = String(page?.sourceType || "").toLowerCase();
+    if (declared === "pdf" || declared === "markdown") {
+      return declared;
+    }
+    if (String(page?.sourceFileName || "").toLowerCase().endsWith(".pdf") || page?.pdfUrl) {
+      return "pdf";
+    }
+    return "markdown";
+  }
+
   function renderSourceChip(page) {
-    const sourceType = (page.sourceType || "markdown").toLowerCase();
+    const sourceType = getPageSourceType(page);
     const label = sourceType === "pdf" ? "PDF" : "Markdown";
     return `<span class="article-chip">${label}</span>`;
   }
@@ -1421,6 +2497,15 @@
     return node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
   }
 
+  function isPdfTextRange(range) {
+    const startElement = getContainerElement(range.startContainer);
+    const endElement = getContainerElement(range.endContainer);
+    return Boolean(
+      startElement?.closest(".pdf-text-layer") &&
+      endElement?.closest(".pdf-text-layer")
+    );
+  }
+
   async function uploadMarkdownFile(file) {
     const markdown = await file.text();
     return fetch("/api/upload-markdown", {
@@ -1515,18 +2600,22 @@
     const articleBody = document.getElementById("articleBody");
     const entries = [];
     const seen = new Set();
+    const visibleNotes = Object.values(notes).filter((note) => note.kind !== "highlight");
 
     if (articleBody) {
-      articleBody.querySelectorAll(".article-annotation[data-note-id]").forEach((element) => {
+      articleBody.querySelectorAll(".article-annotation[data-note-id], .pdf-note-badges [data-note-id]").forEach((element) => {
         const noteId = element.dataset.noteId;
         if (noteId && notes[noteId]) {
+          if (notes[noteId].kind === "highlight") {
+            return;
+          }
           seen.add(noteId);
           entries.push({ note: notes[noteId], element });
         }
       });
     }
 
-    Object.values(notes).forEach((note) => {
+    visibleNotes.forEach((note) => {
       if (!seen.has(note.id)) {
         entries.push({ note, element: null });
       }
@@ -1536,7 +2625,7 @@
   }
 
   function jumpToNote(noteId) {
-    const element = document.querySelector(`.article-annotation[data-note-id="${CSS.escape(noteId || "")}"]`);
+    const element = document.querySelector(`.article-annotation[data-note-id="${CSS.escape(noteId || "")}"], .pdf-note-badge[data-note-id="${CSS.escape(noteId || "")}"], .pdf-mark[data-note-id="${CSS.escape(noteId || "")}"]`);
     if (!element) {
       return;
     }
@@ -1544,7 +2633,7 @@
   }
 
   function openNoteFromSummary(noteId) {
-    const element = document.querySelector(`.article-annotation[data-note-id="${CSS.escape(noteId || "")}"]`);
+    const element = document.querySelector(`.article-annotation[data-note-id="${CSS.escape(noteId || "")}"], .pdf-note-badge[data-note-id="${CSS.escape(noteId || "")}"], .pdf-mark[data-note-id="${CSS.escape(noteId || "")}"]`);
     if (!element) {
       return;
     }
@@ -1562,13 +2651,99 @@
     notePreview.innerHTML = marked.parse(markdown);
   }
 
+  function isPdfPageDetail(detail = state.pageCache[state.ui.activePageId]) {
+    return getPageSourceType(detail?.meta || detail) === "pdf";
+  }
+
+  function getPdfSelectionData(range) {
+    if (!range) {
+      return null;
+    }
+
+    const pageNode = getContainerElement(range.startContainer)?.closest(".pdf-page");
+    const stage = pageNode?.querySelector(".pdf-page-stage");
+    if (!pageNode || !stage) {
+      return null;
+    }
+
+    const rects = normalizePdfSelectionRects(range, stage);
+    if (!rects.length) {
+      return null;
+    }
+
+    return {
+      pageNode,
+      pageNumber: Number(pageNode.dataset.pageNumber || 0),
+      quote: range.toString().trim(),
+      rects
+    };
+  }
+
+  function normalizePdfSelectionRects(range, stage) {
+    const stageRect = stage.getBoundingClientRect();
+    if (!stageRect.width || !stageRect.height) {
+      return [];
+    }
+
+    return Array.from(range.getClientRects())
+      .map((rect) => {
+        const left = clamp((rect.left - stageRect.left) / stageRect.width, 0, 1);
+        const top = clamp((rect.top - stageRect.top) / stageRect.height, 0, 1);
+        const right = clamp((rect.right - stageRect.left) / stageRect.width, 0, 1);
+        const bottom = clamp((rect.bottom - stageRect.top) / stageRect.height, 0, 1);
+        return {
+          left,
+          top,
+          width: Math.max(0, right - left),
+          height: Math.max(0, bottom - top)
+        };
+      })
+      .filter((rect) => rect.width > 0.002 && rect.height > 0.002);
+  }
+
+  function refreshPdfNoteLayers(detail) {
+    if (!isPdfPageDetail(detail)) {
+      return;
+    }
+
+    document.querySelectorAll(".pdf-page[data-page-number]").forEach((pageNode) => {
+      const pageNumber = Number(pageNode.dataset.pageNumber || 0);
+      renderPdfPageMarks(pageNode, detail, pageNumber);
+    });
+  }
+
   function getClosestBlockElement(element) {
-    return element.closest("p,li,blockquote,td,th,h1,h2,h3,h4,h5,h6,pre,code");
+    return element.closest("p,li,blockquote,td,th,h1,h2,h3,h4,h5,h6,pre,code,.pdf-text-layer,.pdf-fallback-body");
   }
 
   async function createHighlightMark(range) {
     if (!range) {
       return null;
+    }
+
+    if (isPdfPageDetail()) {
+      const detail = state.pageCache[state.ui.activePageId];
+      const selectionData = getPdfSelectionData(range);
+      if (!detail || !selectionData) {
+        return null;
+      }
+
+      const noteId = makeId("note");
+      detail.notes[noteId] = {
+        id: noteId,
+        kind: "highlight",
+        quote: selectionData.quote,
+        text: "",
+        updatedAt: new Date().toISOString(),
+        source: "manual",
+        pageNumber: selectionData.pageNumber,
+        rects: selectionData.rects
+      };
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      await persistCurrentPageFromDom();
+      refreshPdfNoteLayers(detail);
+      return { dataset: { noteId } };
     }
 
     const selection = window.getSelection();
@@ -1595,6 +2770,32 @@
     const articleBody = document.getElementById("articleBody");
     if (!detail || !articleBody || !articleBody.contains(range.commonAncestorContainer)) {
       return null;
+    }
+
+    if (isPdfPageDetail(detail)) {
+      const selectionData = getPdfSelectionData(range);
+      if (!selectionData) {
+        return null;
+      }
+
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      const noteId = makeId("note");
+      detail.notes[noteId] = {
+        id: noteId,
+        kind: "annotation",
+        quote: selectionData.quote,
+        text: options.noteText || "",
+        updatedAt: new Date().toISOString(),
+        source: options.source || "manual",
+        pageNumber: selectionData.pageNumber,
+        rects: selectionData.rects
+      };
+      await persistCurrentPageFromDom();
+      refreshPdfNoteLayers(detail);
+      renderAnnotationSummary(detail);
+      const badge = document.querySelector(`.pdf-note-badge[data-note-id="${CSS.escape(noteId)}"]`);
+      return badge || { dataset: { noteId } };
     }
 
     const selection = window.getSelection();
@@ -1658,6 +2859,7 @@
     note.text = text || "";
     note.updatedAt = new Date().toISOString();
     await persistCurrentPageFromDom();
+    refreshPdfNoteLayers(detail);
     renderAnnotationSummary(detail);
 
     if (activeNoteContext && activeNoteContext.noteId === noteId) {
